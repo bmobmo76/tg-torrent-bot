@@ -251,7 +251,7 @@ async def run_job(chat_id: int, msg_id: int, magnet: str, job: dict) -> None:
 
         await edit(bot, chat_id, msg_id, f"📥 {name}\nحجم: {human(total)}\nآماده‌سازی...")
 
-last = 0.0
+        last = 0.0
         while True:
             if job["cancel"]:
                 await edit(bot, chat_id, msg_id, "لغو شد.")
@@ -319,7 +319,6 @@ last = 0.0
         await asyncio.sleep(1)
         shutil.rmtree(save_dir, ignore_errors=True)
         JOBS.pop(chat_id, None)
-
 
 async def on_magnet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update):
