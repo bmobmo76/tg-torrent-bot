@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 import os
 import resource
@@ -35,8 +36,30 @@ ALLOWED_IDS = {
     if x.strip()
 }
 
-WORK_DIR = Path(os.environ.get("WORK_DIR", "/tmp/torrents"))
-WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+def pick_work_dir() -> Path:
+    candidates = [
+        os.environ.get("WORK_DIR", ""),
+        "/var/tmp/torrents",
+        "/opt/render/project/src/dl",
+        "/tmp/torrents",
+    ]
+    for cand in candidates:
+        if not cand:
+            continue
+        p = Path(cand)
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            probe = p / ".probe"
+            probe.write_bytes(b"x" * 1024)
+            probe.unlink()
+            return p
+        except Exception:
+            continue
+    raise RuntimeError("no writable work dir found")
+
+
+WORK_DIR = pick_work_dir()
 
 MAX_BYTES = int(float(os.environ.get("MAX_TORRENT_SIZE_GB", "1")) * 1024 ** 3)
 CHUNK_BYTES = int(float(os.environ.get("UPLOAD_CHUNK_MB", "700")) * 1024 ** 2)
@@ -164,12 +187,12 @@ async def upload_once(bot, chat_id: int, path: Path, caption: str | None) -> Non
 
 async def send_file(bot, chat_id: int, path: Path) -> None:
     size = path.stat().st_size
-    log.info("start sending %s (%.1f MB)", path.name, size / 1024 ** 2)
+    log.info("start sending %s (%.1f MB) rss=%.0fMB", path.name, size / 1024 ** 2, rss_mb())
 
     if size <= min(TG_SAFE, CHUNK_BYTES):
         try:
             await upload_once(bot, chat_id, path, None)
-            log.info("sent %s", path.name)
+            log.info("sent %s rss=%.0fMB", path.name, rss_mb())
             return
         except Exception as e:
             log.warning("single upload of %s failed: %s -> will split", path.name, e)
@@ -187,7 +210,7 @@ async def send_file(bot, chat_id: int, path: Path) -> None:
         caption = f"بخش {i} از {total}"
         for attempt in range(1, 4):
             try:
-                log.info("uploading part %s/%s (%s)", i, total, p.name)
+                log.info("uploading part %s/%s (%s) rss=%.0fMB", i, total, p.name, rss_mb())
                 await upload_once(bot, chat_id, p, caption)
                 break
             except Exception as e:
@@ -234,9 +257,12 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update):
         return
-    du = shutil.disk_usage("/tmp")
+    du = shutil.disk_usage(WORK_DIR)
     await update.message.reply_text(
-        f"RAM: {rss_mb():.0f} MB\nدیسک آزاد: {human(du.free)}\nکارهای فعال: {len(JOBS)}"
+        f"RAM: {rss_mb():.0f} MB\n"
+        f"پوشه: {WORK_DIR}\n"
+        f"دیسک آزاد: {human(du.free)}\n"
+        f"کارهای فعال: {len(JOBS)}"
     )
 
 
@@ -321,6 +347,14 @@ async def run_job(chat_id: int, msg_id: int, magnet: str, job: dict) -> None:
 
         log.info("download finished: %s", name)
         await edit(bot, chat_id, msg_id, "✅ دانلود کامل شد. در حال ارسال...")
+
+        try:
+            SESSION.remove_torrent(handle)
+            handle = None
+        except Exception:
+            pass
+        gc.collect()
+        log.info("session freed, rss=%.0fMB", rss_mb())
 
         files = sorted(p for p in save_dir.rglob("*") if p.is_file())
         log.info("files on disk: %s (%s)", len(files), human(sum(f.stat().st_size for f in files)))
@@ -443,6 +477,7 @@ async def keepalive() -> None:
 
 async def main() -> None:
     cleanup_old()
+    log.info("work dir: %s (free %s)", WORK_DIR, human(shutil.disk_usage(WORK_DIR).free))
 
     app = web.Application()
     app.router.add_get("/", health)
