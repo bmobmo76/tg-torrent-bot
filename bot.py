@@ -1,15 +1,11 @@
 import asyncio
 import logging
 import os
+import resource
 import shutil
 import subprocess
 import time
 import zipfile
-import resource
-
-
-def rss_mb() -> float:
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 from pathlib import Path
 
 import aiohttp
@@ -42,8 +38,8 @@ ALLOWED_IDS = {
 WORK_DIR = Path(os.environ.get("WORK_DIR", "/tmp/torrents"))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_BYTES = int(float(os.environ.get("MAX_TORRENT_SIZE_GB", "1.5")) * 1024 ** 3)
-CHUNK_BYTES = int(float(os.environ.get("UPLOAD_CHUNK_MB", "900")) * 1024 ** 2)
+MAX_BYTES = int(float(os.environ.get("MAX_TORRENT_SIZE_GB", "1")) * 1024 ** 3)
+CHUNK_BYTES = int(float(os.environ.get("UPLOAD_CHUNK_MB", "700")) * 1024 ** 2)
 TG_SAFE = 1980 * 1024 * 1024
 
 PUBLIC_URL = (
@@ -82,6 +78,10 @@ except Exception:
     SESSION = lt.session()
 
 JOBS: dict[int, dict] = {}
+
+
+def rss_mb() -> float:
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
 def human(n: float) -> str:
@@ -175,11 +175,13 @@ async def send_file(bot, chat_id: int, path: Path) -> None:
             log.warning("single upload of %s failed: %s -> will split", path.name, e)
 
     parts = await asyncio.to_thread(split_file, path, CHUNK_BYTES)
+
     try:
         path.unlink()
         log.info("removed original to free disk")
     except Exception:
         pass
+
     total = len(parts)
     for i, p in enumerate(parts, 1):
         caption = f"بخش {i} از {total}"
@@ -194,6 +196,48 @@ async def send_file(bot, chat_id: int, path: Path) -> None:
                     await bot.send_message(chat_id, f"بخش {i} ارسال نشد: {e}")
                 else:
                     await asyncio.sleep(5 * attempt)
+
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await guard(update):
+        return
+    await update.message.reply_text(
+        "سلام.\n\nلینک مگنت بفرست تا دانلود کنم و فایل را تحویل بدهم.\n\n"
+        "• /cancel لغو دانلود جاری\n"
+        "• /debug وضعیت رم و دیسک\n"
+        "• سقف هر تورنت ۱ گیگابایت\n"
+        "• فایل بزرگ خودکار تکه می‌شود"
+    )
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await guard(update):
+        return
+    await update.message.reply_text(
+        "۱. لینک مگنت را کپی کن.\n۲. بفرست.\n۳. منتظر بمان.\n۴. فایل تکه‌تکه می‌رسد.\n\n"
+        "روی ویندوز با `copy /b` و روی لینوکس با `cat` دوباره یکی‌شان کن."
+    )
+
+
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await guard(update):
+        return
+    chat_id = update.effective_chat.id
+    job = JOBS.get(chat_id)
+    if not job:
+        await update.message.reply_text("دانلودی در جریان نیست.")
+        return
+    job["cancel"] = True
+    await update.message.reply_text("دارم لغو می‌کنم...")
+
+
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await guard(update):
+        return
+    du = shutil.disk_usage("/tmp")
+    await update.message.reply_text(
+        f"RAM: {rss_mb():.0f} MB\nدیسک آزاد: {human(du.free)}\nکارهای فعال: {len(JOBS)}"
+    )
 
 
 async def run_job(chat_id: int, msg_id: int, magnet: str, job: dict) -> None:
@@ -320,6 +364,7 @@ async def run_job(chat_id: int, msg_id: int, magnet: str, job: dict) -> None:
         shutil.rmtree(save_dir, ignore_errors=True)
         JOBS.pop(chat_id, None)
 
+
 async def on_magnet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await guard(update):
         return
@@ -338,13 +383,7 @@ async def on_magnet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text("در حال آماده‌سازی...")
     asyncio.create_task(run_job(chat_id, msg.message_id, text, job))
 
-async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await guard(update):
-        return
-    du = shutil.disk_usage("/tmp")
-    await update.message.reply_text(
-        f"RAM: {rss_mb():.0f} MB\nدیسک آزاد: {human(du.free)}\nکارهای فعال: {len(JOBS)}"
-    )
+
 application = (
     Application.builder()
     .token(BOT_TOKEN)
@@ -355,8 +394,89 @@ application = (
     .build()
 )
 
-application.add_handler(CommandHandler("start", cmd_start := None) or CommandHandler("start", on_magnet))
-application.add_handler(CommandHandler("help", on_magnet))
-application.add_handler(CommandHandler("cancel", on_magnet))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_magnet))
+application.add_handler(CommandHandler("start", cmd_start))
+application.add_handler(CommandHandler("help", cmd_help))
+application.add_handler(CommandHandler("cancel", cmd_cancel))
 application.add_handler(CommandHandler("debug", cmd_debug))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_magnet))
+
+
+async def health(request: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+
+async def hook(request: web.Request) -> web.Response:
+    data = await request.json()
+    update = Update.de_json(data, application.bot)
+    await application.update_queue.put(update)
+    return web.Response(text="ok")
+
+
+async def poll_loop() -> None:
+    offset = 0
+    while True:
+        try:
+            updates = await application.bot.get_updates(
+                offset=offset, timeout=30, allowed_updates=["message"]
+            )
+            for u in updates:
+                offset = u.update_id + 1
+                await application.update_queue.put(u)
+        except Exception:
+            await asyncio.sleep(3)
+
+
+async def keepalive() -> None:
+    if not PUBLIC_URL:
+        return
+    url = PUBLIC_URL + "/"
+    await asyncio.sleep(120)
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=30) as r:
+                    await r.read()
+        except Exception:
+            pass
+        await asyncio.sleep(600)
+
+
+async def main() -> None:
+    cleanup_old()
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_post(f"/{BOT_TOKEN}", hook)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+
+    await application.initialize()
+    await application.start()
+    await application.bot.set_my_commands(
+        [
+            BotCommand("start", "شروع"),
+            BotCommand("help", "راهنما"),
+            BotCommand("cancel", "لغو دانلود"),
+            BotCommand("debug", "وضعیت سرور"),
+        ]
+    )
+
+    if PUBLIC_URL:
+        url = f"{PUBLIC_URL}/{BOT_TOKEN}"
+        await application.bot.set_webhook(
+            url, allowed_updates=["message"], drop_pending_updates=True, max_connections=8
+        )
+        log.info("webhook: %s", url)
+        asyncio.create_task(keepalive())
+    else:
+        log.info("no public url, falling back to polling")
+        asyncio.create_task(poll_loop())
+
+    log.info("listening on %s", PORT)
+    await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
